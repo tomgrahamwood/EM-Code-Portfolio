@@ -1,0 +1,377 @@
+USE [ExposureManagement]
+GO
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+--=========================================================================-- 
+-- Author: Wood, Thomas
+-- Create Date: 13/01/2021
+-- Description: Used to select or delete childless records from an EDM.
+-- Inputs:  @EDM_Name = Name of EDM you wish to the run the SP on.
+--          @Run_Type = 'select' or 'delete' the childless records (use select before using delete).
+-- Outputs: @Error = If the SP encounters and error, it will be displayed via this output.
+--=========================================================================--
+
+CREATE PROCEDURE [dbo].[sp_Childless_Records_SelecDelete] 
+
+ @EDM_Name NVARCHAR(255),
+ @Run_Type NVARCHAR(7),
+ @Error nvarchar(max) = NULL OUTPUT
+
+AS 
+BEGIN
+	SET NOCOUNT ON;
+
+	DECLARE @SQL NVARCHAR(MAX)
+	DECLARE @SQL_SelDel NVARCHAR(MAX)
+	DECLARE @RowCount INT
+	DECLARE @ParmDef NVARCHAR(MAX)
+	DECLARE @Childlessloccon NVARCHAR(MAX)
+	DECLARE @Childlesspolicy NVARCHAR(MAX)
+	DECLARE @Childlessaddress NVARCHAR(MAX)
+	DECLARE @Childlessloccvg NVARCHAR(MAX)
+	DECLARE @Childlessbidet NVARCHAR(MAX)
+	DECLARE @Childlessproperty NVARCHAR(MAX)
+	DECLARE @Childlessaccgrp NVARCHAR(MAX)
+
+SET @SQL_SelDel = CASE WHEN @Run_Type = 'select' THEN 'select @rowcount = count(*) '
+					   WHEN @Run_Type = 'delete' THEN 'delete TOP (100000) a '                              -- delete top 100,000 to keep log file size down, means we must loop the deletion process incase the number of rows is over 100,000
+					   END
+
+-- If you wish to change the logic for childless records you only need to alter the below 7 defined variables.
+
+-- Childless locconditions from policyconditions parent
+
+SET @Childlessloccon = 'FROM	
+						'+@EDM_Name+'.dbo.policyconditions AS a
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.locconditions AS b
+							ON a.conditionid = b.conditionid
+						WHERE b.conditionid IS NULL'
+
+-- Childless policy from accgrp parent
+
+SET @Childlesspolicy = 'FROM
+						'+@EDM_Name+'.dbo.accgrp AS a
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.policy AS b
+							ON a.accgrpid = b.accgrpid
+						WHERE b.accgrpid IS NULL'
+
+-- Childless address from property parent
+
+SET @Childlessaddress ='FROM
+						'+@EDM_Name+'.dbo.property AS a
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.address AS b
+							ON a.addressid = b.addressid
+						WHERE b.addressid IS NULL'
+
+-- Childless loccvg from property parent
+
+SET @Childlessloccvg = 'FROM
+						'+@EDM_Name+'.dbo.property AS a
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.loccvg AS b
+							ON a.locid = b.locid
+						WHERE b.locid IS NULL'
+
+-- Childless det tables from property parent
+
+SET @Childlessbidet =	'FROM
+						'+@EDM_Name+'.dbo.property AS a
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.bidet b				ON a.locid = b.locid
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.eqdet c				ON a.locid = c.locid
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.hudet d				ON a.locid = d.locid
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.todet e				ON a.locid = e.locid
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.frdet f				ON a.locid = f.locid
+						LEFT OUTER JOIN	'+@EDM_Name+'.dbo.trdet g				ON a.locid = g.locid
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.wcdet h				ON a.locid = h.locid
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.fldet i				ON a.locid = i.locid
+						WHERE COALESCE(b.locid, c.locid, d.locid, e.locid, f.locid, e.locid, f.locid, g.locid, h.locid, i.locid) IS NULL'
+
+-- Childless property from accgrp parent
+
+SET @Childlessproperty ='FROM
+						'+@EDM_Name+'.dbo.accgrp AS a
+						LEFT OUTER JOIN '+@EDM_Name+'.dbo.property AS b
+							ON a.accgrpid = b.accgrpid
+						WHERE b.accgrpid IS NULL'
+
+-- Childless accgrp from portacct parent
+
+SET @Childlessaccgrp = 'FROM
+					   '+@EDM_Name+'.dbo.portacct AS a
+					 	LEFT OUTER JOIN '+@EDM_Name+'.dbo.accgrp AS b
+							ON a.accgrpid = b.accgrpid
+						WHERE b.accgrpid IS NULL'
+
+
+--===============================================================================================-- 
+--------------------------------------- Section 1 -- 'select' -------------------------------------
+--===============================================================================================--
+
+IF @Run_type = 'select'
+BEGIN TRY
+	BEGIN TRANSACTION 
+
+		-- Create Childlesslog if it does not already exist
+
+		SET @SQL =
+			'IF OBJECT_ID('''+@EDM_Name+'.dbo.Childlesslog'') IS NULL 
+			CREATE TABLE '+@EDM_Name+'.dbo.Childlesslog
+			(
+			TableID INT Identity(1,1),
+			ParentTable Varchar(32),
+			ChildTable Varchar (32),
+			RecordsDeleted INT,
+			RunDate datetime,
+			UserName Varchar (32)
+			)'
+		EXEC (@SQL)
+
+		-- Childless locconditions from policyconditions parent
+
+		SET @SQL = @SQL_SelDel + @Childlessloccon
+
+		SET @ParmDef = N'@rowcount INT OUTPUT'
+
+		EXECUTE sp_executesql @SQL, @ParmDef, @RowCount = @RowCount OUTPUT
+
+		SET @SQL =
+		'INSERT INTO '+@EDM_Name+'.dbo.Childlesslog (ParentTable, ChildTable, RecordsDeleted, RunDate, UserName)
+		VALUES (''policyconditions'', ''locconditions'', '+CAST(@ROWCOUNT as varchar)+', CURRENT_TIMESTAMP, SYSTEM_USER)'
+
+		EXEC (@SQL)
+
+		-- Childless policy from accgrp parent
+
+		SET @SQL = @SQL_SelDel + @Childlesspolicy
+	
+		SET @ParmDef = N'@rowcount INT OUTPUT'
+
+		EXECUTE sp_executesql @SQL, @ParmDef, @RowCount = @RowCount OUTPUT
+
+		SET @SQL =
+		'INSERT INTO '+@EDM_Name+'.dbo.Childlesslog (ParentTable, ChildTable, RecordsDeleted, RunDate, UserName)
+		VALUES (''accgrp'', ''policy'', '+CAST(@ROWCOUNT as varchar)+', CURRENT_TIMESTAMP, SYSTEM_USER)'
+
+		EXEC (@SQL)
+
+		-- Childless address from property parent
+
+		SET @SQL = @SQL_SelDel + @Childlessaddress
+			
+		SET @ParmDef = N'@rowcount INT OUTPUT'
+
+		EXECUTE sp_executesql @SQL, @ParmDef, @RowCount = @RowCount OUTPUT
+
+		SET @SQL =
+		'INSERT INTO '+@EDM_Name+'.dbo.Childlesslog (ParentTable, ChildTable, RecordsDeleted, RunDate, UserName)
+		VALUES (''property'', ''address'', '+CAST(@ROWCOUNT as varchar)+', CURRENT_TIMESTAMP, SYSTEM_USER)'
+
+		EXEC (@SQL)
+
+		-- Childless loccvg from property parent
+
+		SET @SQL = @SQL_SelDel + @Childlessloccvg
+	
+		SET @ParmDef = N'@rowcount INT OUTPUT'
+
+		EXECUTE sp_executesql @SQL, @ParmDef, @RowCount = @RowCount OUTPUT 
+
+		SET @SQL =
+		'INSERT INTO '+@EDM_Name+'.dbo.Childlesslog (ParentTable, ChildTable, RecordsDeleted, RunDate, UserName)
+		VALUES (''property'', ''loccvg'', '+CAST(@ROWCOUNT as varchar)+', CURRENT_TIMESTAMP, SYSTEM_USER)'
+
+		EXEC (@SQL)
+
+		-- Childless det tables from property parent
+
+		SET @SQL = @SQL_SelDel + @Childlessbidet
+	
+		SET @ParmDef = N'@rowcount INT OUTPUT'
+
+		EXECUTE sp_executesql @SQL, @ParmDef, @RowCount = @RowCount OUTPUT
+
+		SET @SQL =
+		'INSERT INTO '+@EDM_Name+'.dbo.Childlesslog (ParentTable, ChildTable, RecordsDeleted, RunDate, UserName)
+		VALUES (''property'', ''det_tables'', '+CAST(@ROWCOUNT as varchar)+', CURRENT_TIMESTAMP, SYSTEM_USER)'
+
+		EXEC (@SQL)
+
+		-- Childless property from accgrp parent
+
+		SET @SQL =  @SQL_SelDel + @Childlessproperty
+			
+		SET @ParmDef = N'@rowcount INT OUTPUT'
+
+		EXECUTE sp_executesql @SQL, @ParmDef, @RowCount = @RowCount OUTPUT
+
+		SET @SQL =
+		'INSERT INTO '+@EDM_Name+'.dbo.Childlesslog (ParentTable, ChildTable, RecordsDeleted, RunDate, UserName)
+		VALUES (''accgrp'', ''property'', '+CAST(@ROWCOUNT as varchar)+', CURRENT_TIMESTAMP, SYSTEM_USER)'
+
+		EXEC (@SQL)
+
+		-- Childless accgrp from portacct parent
+
+		SET @SQL = @SQL_SelDel + @Childlessaccgrp
+		
+		SET @ParmDef = N'@rowcount INT OUTPUT'
+
+		EXECUTE sp_executesql @SQL, @ParmDef, @RowCount = @RowCount OUTPUT
+
+		SET @SQL =
+		'INSERT INTO '+@EDM_Name+'.dbo.Childlesslog (ParentTable, ChildTable, RecordsDeleted, RunDate, UserName)
+		VALUES (''portacct'', ''accgrp'', '+CAST(@ROWCOUNT as varchar)+', CURRENT_TIMESTAMP, SYSTEM_USER)'
+
+		EXEC (@SQL)
+
+		-- Select Childlesslog table you have just populated
+
+		SET @SQL =   -- this could use improvement
+		'SELECT *
+		FROM '+@EDM_Name+'.dbo.childlesslog
+		WHERE CAST(RunDate AS DATE) = CAST(GETDATE() AS DATE)'
+
+		EXEC (@SQL)
+
+		COMMIT TRANSACTION
+
+		SET @Error = 'Childless select stored procedure run succesfully'
+END TRY
+
+BEGIN CATCH
+		SET @Error =
+		' Error_Number: '+ CAST(ERROR_NUMBER() AS VARCHAR) +
+		' Error_Severity: '+ CAST(ERROR_SEVERITY() AS VARCHAR) +
+		' Error_State: ' + CAST(ERROR_STATE() AS VARCHAR) + 
+		' Error_Message: ' + ERROR_MESSAGE() + 
+		' Error_Line: ' + CAST(ERROR_LINE() AS VARCHAR)
+	   ROLLBACK
+END CATCH
+
+
+--===============================================================================================-- 
+------------------------------------ Section 2 -- 'delete' ----------------------------------------
+--===============================================================================================--
+
+-- If an error is detected it will be displayed via the @Error output and the transaction will be rolled back, i.e. no records will be deleted.
+
+IF @Run_type = 'delete'
+BEGIN TRY
+		BEGIN TRANSACTION 
+
+			DECLARE	@Deleted_Rows INT
+	
+		-- Childless locconditions from policyconditions parent
+
+			SET @Deleted_Rows = 1;
+			WHILE (@Deleted_Rows > 0)
+			BEGIN		
+				SET @SQL =   @SQL_SelDel + @Childlessloccon
+
+				EXEC (@SQL)
+
+				SET @Deleted_Rows = @@ROWCOUNT;
+			END	
+
+		-- Childless policy from accgrp parent
+
+			SET @Deleted_Rows = 1;
+			WHILE (@Deleted_Rows > 0)
+			BEGIN
+				SET @SQL =  @SQL_SelDel + @Childlesspolicy
+
+				EXEC (@SQL)
+
+				SET @Deleted_Rows = @@ROWCOUNT;
+			END	
+
+		-- Childless address from property parent
+
+			SET @Deleted_Rows = 1;
+			WHILE (@Deleted_Rows > 0)
+			BEGIN
+				SET @SQL =  @SQL_SelDel + @Childlessaddress
+
+				EXEC (@SQL)
+
+				SET @Deleted_Rows = @@ROWCOUNT;
+			END	
+
+		-- Childless loccvg from property parent
+
+			SET @Deleted_Rows = 1;
+			WHILE (@Deleted_Rows > 0)
+			BEGIN
+				SET @SQL =  @SQL_SelDel + @Childlessloccvg
+
+				EXEC (@SQL)
+
+				SET @Deleted_Rows = @@ROWCOUNT;
+			END	
+
+		-- Childless det tables from property parent
+
+			SET @Deleted_Rows = 1;
+			WHILE (@Deleted_Rows > 0)
+			BEGIN			
+				SET @SQL =  @SQL_SelDel + @Childlessbidet
+
+				EXEC (@SQL)
+
+				SET @Deleted_Rows = @@ROWCOUNT;
+			END	
+
+		-- Childless property from accgrp parent
+
+			SET @Deleted_Rows = 1;
+			WHILE (@Deleted_Rows > 0)
+			BEGIN
+
+				SET @SQL =  @SQL_SelDel + @Childlessproperty
+
+				EXEC (@SQL)
+
+				SET @Deleted_Rows = @@ROWCOUNT;
+
+			END	
+
+		-- Childless accgrp from portacct parent
+
+			SET @Deleted_Rows = 1;
+			WHILE (@Deleted_Rows > 0)
+			BEGIN
+
+				SET @SQL =  @SQL_SelDel + @Childlessaccgrp
+
+				EXEC (@SQL)
+
+				SET @Deleted_Rows = @@ROWCOUNT;
+
+			END
+	
+		COMMIT TRANSACTION
+
+		SET @Error = 'All Childless Records were deleted successfully'
+END TRY
+
+BEGIN CATCH
+		SET @Error =
+		' Error_Number: '+ CAST(ERROR_NUMBER() AS VARCHAR) +
+		' Error_Severity: '+ CAST(ERROR_SEVERITY() AS VARCHAR) +
+		' Error_State: ' + CAST(ERROR_STATE() AS VARCHAR) + 
+		' Error_Message: ' + ERROR_MESSAGE() + 
+		' Error_Line: ' + CAST(ERROR_LINE() AS VARCHAR)
+		ROLLBACK
+END CATCH
+
+--===============================================================================================-- 
+------------------------------------ Section 3 -- ELSE do not run ---------------------------------
+--===============================================================================================--
+
+-- If the @Run_type is not 'select' or 'delete' then the SP will not run and script and only print the below message.
+
+ELSE
+PRINT 'Incorrect @Run_type, please enter select or delete only.'
+
+END;
