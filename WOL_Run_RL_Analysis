@@ -1,0 +1,593 @@
+#This is an R script FYI.
+
+#Title: WOL_Run_RL_Analysis
+#Author: Tom Wood
+#Creation date: 22/02/2022
+
+# Packages required:
+
+#Prerequisites:
+#Check scenarios are the same, if they have changed, amend step 7
+#Update step 6 Jobid 
+#Stamping of locations via ARCGIS has been run.
+
+
+#Description:
+#Step 1 - Retrieves DB connections & RDS info from EM code base. 
+        - Then sets variables we call later in the process.
+#Step 2 - Moves WOL stamped locations table to the needed DB so we can easily reference it later. 
+        - Invalidate all locations. 
+        - Saves a backup of locations values as a table & saves a backup of locaiton country as a table. (needed as we manipulate them in the process)
+        - Retrieve War porfolio ID + set it as a varaible to reference later.
+#Step 3 - Sets up 2 functions to use later, these being:
+        - damageandvalidateExclpoorgeocode =  this function damages locations & validates all locations within the defined scenario. This is determined 
+                                              via the GIS table created earlier.
+        - uniquecountrycodes = Determines all countries in the WOL scenario and sets them to SA, so when the country-level analysis is run the policy terms are
+                                applied once.                             
+#Step 4 - Sets up 3 functions to use later, these being:
+        - revertloccvgvalues = reverts the damaged location values back to that held within the backup table created earlier.
+        - revertcountrycodevalue = reverts the damaged country values back to that held within the backup table created earlier.
+        - reverteverything = sets isvalid to 1.
+#Step 5 - Sets up run Risklink analysis function. This calls a SQL that can be found in the 
+#Step 6 - Sets up Risklink finished loop function.
+#Step 7 - Runs the 20 WOL scenarios.
+#Appendix - Line 535
+
+#---------------------------------------------------------------------------------------------------------------------------------------#
+#  1. SCRIPT SET UP
+#---------------------------------------------------------------------------------------------------------------------------------------#
+
+# Load Source start code function and RDS date updater                                                   
+
+source("\\\\fs01\\DepartmentFolders$\\Exposure Management\\EMDM\\CentralFunctions\\PRD\\StartCode\\Scripts\\StartCodeFunction.r")
+source ("G:\\Exposure Management\\RealisticDisasterScenarios\\Scripts\\01_SetUp\\RDS_01_SetUp_01_GetRDSDates.r")
+
+
+# Set up connections and table names                                                           
+
+WOLEDM <- paste("EDM_", RLVers, "_WOLEV_RDS_", RDS_YearNum, RDS_MonthNum, RDS_dayNum, sep="")
+WOLRDM <- paste("RDM_", RLVers, "_WOLEV_RDS_", RDS_YearNum, RDS_MonthNum, RDS_dayNum, sep="")
+stampedFile <- paste("WarRegionsRDS_", RDS_YearNum, RDS_MonthNum, RDS_dayNum, "_damloc", sep = "")
+currentYearScenariosLookup <- paste("WarRegionsRDS_", RDS_YearNum, "_scenarios", sep = "")
+warDB <- "EXP_WAR"
+
+StartCode(Server = RLServerName, DB = WOLEDM, Server3 = "UKAGGS01", DB3 = "EM_REFDATA", WH = FALSE)
+
+
+#---------------------------------------------------------------------------------------------------------------------------------------#
+#  2. PREPARE THE DATA
+#  Copy GIS output tables from WOLEV to the warDB database 
+#---------------------------------------------------------------------------------------------------------------------------------------#
+
+sqlQuery(channel1, paste0("
+
+IF OBJECT_ID('",warDB,".dbo.",stampedFile,"','U') IS NOT NULL
+DROP TABLE ",warDB,".dbo.",stampedFile,"
+
+CREATE TABLE ",warDB,".dbo.",stampedFile," (
+	FID int NULL,
+	Shape varchar(255) NULL,
+        LOCID decimal(18, 0) NULL,
+        addressID decimal(18, 0) NULL,
+        RMSISO varchar(2) NULL,
+        RMSCode varchar(2) NULL,
+        lat decimal(9, 6) NULL,
+        lon decimal(9, 6) NULL,
+        ADDRMATCH smallint NULL,
+        ACCGRPID decimal(18, 0) NULL,
+        alpha2 varchar(2) NULL,
+        name varchar(255) NULL,
+        MainCountr decimal(18, 0) NULL,
+        ScenarioID decimal(18, 0) NULL,
+        Scenario varchar(255) NULL,
+        AdminID int NULL,
+        Likelihood varchar(255) NULL,
+        ValidFrom datetime NULL,
+        ValidTo datetime NULL,
+        DamFac float NULL
+)
+
+INSERT INTO  ",warDB,".dbo.",stampedFile,"
+SELECT * FROM ",WOLEDM,".dbo.",stampedFile
+))
+
+
+# Invalidate all locations
+
+sqlQuery(channel1, paste("UPDATE loc SET ISVALID = 0", sep = ""))
+
+
+# Save a backup of LOCCVG values                                               
+
+sqlQuery(channel1, paste("DROP TABLE loccvg_bk", sep = ""))
+
+sqlQuery(channel1, paste("
+
+    SELECT 
+         LOCCVGID,
+        LOCID,
+        PERIL,
+        VALUEAMT,
+        VALUECUR,
+        LOSSTYPE
+    INTO loccvg_bk  
+    FROM loccvg
+    ", 
+                         sep = ""))
+
+
+# Create LOC country backup
+
+sqlQuery(channel1, paste("DROP TABLE loc_country_bk", sep = ""))
+
+sqlQuery(channel1, paste("
+    
+    SELECT LOCID,
+           COUNTRY
+    
+    INTO loc_country_bk  
+    FROM loc
+
+    ",
+                         sep = ""))        
+
+
+# Get the WAR Portfolio ID
+# Make sure the porname for the war portfolio is 'WAR'. 
+
+warPortID <- sqlQuery(channel1, 
+                      paste("select PORTINFOID from portinfo where PORTNum = 'WAR'", sep = ""))
+
+
+#---------------------------------------------------------------------------------------------------------------------------------------#
+#  3. CREATE DAMAGE AND VALIDATE ALL LOCATIONS (EXCLUDING THOSE WITH NO COORDINATE INFORMATION) FUNCTION
+#---------------------------------------------------------------------------------------------------------------------------------------#
+
+damageAndValidateExclPoorGeocode <- function(scenario = ""){
+
+  # Make locations valid that are part of the scenario
+        
+    sqlQuery(channel1, paste("
+    
+        update Loc
+        set ISVALID = 1 
+        where LOCID in (
+                				select locid 
+                				from loc
+                				where locid in (
+                        								select locid 
+                        								FROM ",warDB,".dbo.",stampedFile," 
+                        								where Scenario = '",scenario,"'
+                        								and DamFac <> 0
+                        								)				
+                				and ACCGRPID in (select accgrpid from portacct where portinfoid = ",warPortID,")
+                				)
+    
+    ",
+    sep = ""))
+    
+    print(paste("Locations in EDM that are in the stamped file (therefore good geocoding) have been validated for the ",scenario," scenario.", sep=""))
+          
+    
+    # Damage locations with the relevant damage factor
+        
+    sqlQuery(channel1, paste("
+    
+        update lc
+        set valueamt = valueamt * s.damfac
+        
+        from loc l
+        
+        inner join loccvg lc
+        on l.LOCID = lc.locid
+        
+        inner join ",warDB,".dbo.",stampedFile," s
+        on lc.LOCID = s.locid
+        
+        where Scenario = '",scenario,"'
+        and l.ACCGRPID in (select accgrpid from portacct where portinfoid = ",warPortID,")
+        and s.DamFac <> 0 	
+    
+    ",
+    sep = ""))
+    
+    print(paste("Locations in EDM that are in the stamped file (therefore good geocoding) have been damaged for the ",scenario," scenario.", sep=""))    
+    
+    
+    # Need to get all countries in the scenario
+    
+    uniqueCountryCodes <- sqlQuery(channel1, paste("
+    
+        select DISTINCT (alpha2) as CountryCode
+        from ",warDB,".dbo.",currentYearScenariosLookup,"
+        where scenario = '",scenario,"' 
+    
+    ",
+    sep = ""))
+    
+    for (i in 1:nrow(uniqueCountryCodes)){
+    
+      if (i != nrow(uniqueCountryCodes)){ 
+        countryCodeForQuery <- paste("'",uniqueCountryCodes[i,1],"',",sep="")
+      }else{
+        countryCodeForQuery <- paste("'",uniqueCountryCodes[i,1],"'",sep="")
+      }
+      
+      if(i==1){
+        countryCodeString <- countryCodeForQuery
+      }else{
+        countryCodeString <- paste(countryCodeString, countryCodeForQuery, sep="")
+      } 
+    }
+    
+    print(paste(countryCodeString, " are the country codes for the ", scenario, " scenario.", sep=""))
+    
+    
+    # Set all valid locations in the relevant countries to Saudi Arabia country code
+    
+    sqlQuery(channel1,paste("
+    
+        UPDATE loc    
+        SET COUNTRY = 'SA', 
+            CNTRYCODE = 'SA'          
+        WHERE COUNTRY in (",countryCodeString,") AND isvalid = 1
+    
+    ",
+    sep=""))
+
+
+}
+
+
+#---------------------------------------------------------------------------------------------------------------------------------------#
+#  4. CREATE REVERT FUNCTION
+# Risk Link analysis for each scenario and BEFORE running the Validate Function. 
+#---------------------------------------------------------------------------------------------------------------------------------------#
+
+# Build Revert Loccvg values function
+
+revertLOCCVGValues <- paste("
+
+  UPDATE lc
+  SET lc.VALUEAMT = bk.VALUEAMT, 
+      lc.VALUECUR = bk.VALUECUR
+   
+  FROM loccvg lc
+  LEFT JOIN loccvg_bk bk
+  ON lc.LOCCVGID = bk.LOCCVGID AND lc.LOCID = bk.LOCID AND lc.PERIL = bk.PERIL AND lc.LOSSTYPE = bk.LOSSTYPE
+
+",
+sep = "")
+
+# Revert country codes function 
+
+revertCountryCodeValues <- paste("
+ 
+    UPDATE l 
+    SET l.COUNTRY = lb.COUNTRY,
+        l.CNTRYCODE = lb.COUNTRY
+    FROM loc l
+    inner join loc_country_bk lb
+    on l.locid = lb.locid  
+
+",
+sep = "")
+
+revertEverything <- function() {
+
+  sqlQuery(channel1,paste("UPDATE loc SET ISVALID = 0 WHERE ISVALID = 1", sep=""))
+  sqlQuery(channel1, revertLOCCVGValues) 
+  sqlQuery(channel1, revertCountryCodeValues) 
+  
+}
+
+#---------------------------------------------------------------------------------------------------------------------------------------#
+# 5. Analysis Run Function
+#---------------------------------------------------------------------------------------------------------------------------------------#
+
+runwolscenario <- function(scenario = ""){
+ sqlQuery(channel1, paste("exec [dbo].[WOL_Run_Scenario]@Scenario_name=",scenario,""
+                         , sep = ""))
+
+print(paste("",scenario," scenario analysis is now running in Risklink. Please wait for the analysis to finish", sep=""))} 
+
+#---------------------------------------------------------------------------------------------------------------------------------------#
+# 6. Analysis Run Finsihed Loop Function
+# Waiting for Risklink Analysis to Run
+#---------------------------------------------------------------------------------------------------------------------------------------#
+#analysisrunfinished checks the Risklink job every 30 seconds
+
+analysisrunfinished <- "8"
+
+while(analysisrunfinished = "8") {
+analysisrunfinished <- is.integer(sqlQuery(channel1, paste("
+    SELECT ExecutionStateID
+    FROM RMS_HYDRAJOB.JOB.JOB
+    WHERE JOBID='9309'                                        "))[1])
+  
+  if (analysisrunfinished = "8") {Sys.sleep(30)} 
+}
+
+
+#---------------------------------------------------------------------------------------------------------------------------------------#
+# 7. Run Scenarios
+#---------------------------------------------------------------------------------------------------------------------------------------#
+
+#### Scenario 1
+# Afghan Civil war
+damageAndValidateExclPoorGeocode("Afghan Civil war")
+
+runwolscenario("AfghanCivilwar")
+
+revertEverything()
+
+
+#### Scenario 2
+# Belarus vs. Poland
+damageAndValidateExclPoorGeocode("Belarus vs. Poland")
+
+runwolscenario("BelarusvsPoland")
+
+revertEverything()
+
+
+#### Scenario 3
+# Brazil Civil Conflict
+damageAndValidateExclPoorGeocode("Brazil Civil Conflict")
+
+runwolscenario("BrazilCivilConflict")
+
+revertEverything()
+
+
+#### Scenario 4
+# CHINA CIVIL CONFLICT
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("China Civil Conflict")
+
+runwolscenario("China Civil Conflict")
+
+revertEverything()
+
+
+#### Scenario 5
+# DRC Civil Conflict
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("DRC Civil Conflict")
+
+runwolscenario("DRCCivilConflict")
+
+revertEverything()
+
+
+#### Scenario 6
+# East China Sea
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("East China Sea")
+
+runwolscenario("EastChinaSea")
+
+revertEverything()
+
+
+#### Scenario 7
+# Egypt Civil Conflict
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Egypt Civil Conflict")
+
+runwolscenario("EgyptCivilConflict")
+
+revertEverything()
+
+
+#### Scenario 8
+# Hizbullah vs Israel
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Hizbullah vs Israel")
+
+runwolscenario("HizbullahvsIsrael")
+
+revertEverything()
+
+
+#### Scenario 9
+# India vs Pakistan
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("India vs Pakistan")
+
+runwolscenario("IndiavsPakistan")
+
+revertEverything()
+
+
+#### Scenario 10
+# Iran vs USA
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Iran vs USA")
+
+runwolscenario("IranvsUSA")
+
+revertEverything()
+
+
+#### Scenario 11
+# Iraq Civil Conflict
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Iraq Civil Conflict")
+
+runwolscenario("IraqCivilConflict")
+
+revertEverything()
+
+
+#### Scenario 12
+# Israel vs Palestinian militant groups in Gaza (new)
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Israel vs Palestinian militant groups in Gaza (new)")
+
+runwolscenario("IsraelvsPalestinian")
+
+revertEverything()
+
+
+#### Scenario 13
+# Lebanon Civil Conflict
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Lebanon Civil Conflict")
+
+runwolscenario("LebanonCivilConflict")
+
+revertEverything()
+
+
+#### Scenario 14
+# Myanmar Civil conflict
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Myanmar Civil conflict")
+
+runwolscenario("MyanmarCivilconflict")
+
+revertEverything()
+
+
+#### Scenario 15
+# Nigeria Civil Conflict
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Nigeria Civil Conflict")
+
+runwolscenario("NigeriaCivilConflict")
+
+revertEverything()
+
+
+#### Scenario 16
+# North Korea vs South Korea
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("North Korea vs South Korea")
+
+runwolscenario("NorthKoreavsSouthKorea")
+
+revertEverything()
+
+
+#### Scenario 17
+# Russia - Ukraine
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Russia - Ukraine")
+
+runwolscenario("RussiaUkraine")
+
+revertEverything()
+
+
+#### Scenario 18
+# South China Sea Conflict
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("South China Sea Conflict")
+
+runwolscenario("SouthChinaSeaConflict")
+
+revertEverything()
+
+
+#### Scenario 19
+# Thailand Civil Conflict
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Thailand Civil Conflict")
+
+runwolscenario("ThailandCivilConflict")
+
+revertEverything()
+
+
+#### Scenario 20
+# Turkey Civil Conflict
+
+# EXCLUDING poorly geocoded locations
+damageAndValidateExclPoorGeocode("Turkey Civil Conflict")
+
+runwolscenario("TurkeyCivilConflict")
+
+revertEverything()
+
+
+odbcCloseAll()
+
+
+
+################################################### END OF SCRIPT #############################################################
+
+-----------------------------------------------------------------
+Appendix 1 - EXP_WAR.dbo.WOL_Run_Scenario
+-----------------------------------------------------------------
+USE [EXP_WAR]
+GO
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE PROCEDURE [dbo].[WOL_Run_Scenario] (@Scenario_Name VARCHAR(64))
+AS
+BEGIN
+	
+	SET NOCOUNT ON;
+
+-- Re-runs WOL Country-Level Analysis along with updating the analysis name
+
+	EXEC [dbo].[ChangeJobTaskAnalysisName] @Jobid=9309,@NewName=@Scenario_Name   -- Update Jobid when the RDM is reset or migrated.
+
+	UPDATE RMS_HYDRAJOB.Job.Job
+	SET ExecutionStateID = 8,ScheduledStartTime = CURRENT_TIMESTAMP,EndTime=NULL
+	where	jobid=9309														-- Update Jobid when the RDM is reset or migrated.
+		and ExecutionStateId IN (4,7,8)
+
+END
+
+-----------------------------------------------------------------
+Appendix 2 - EXP_WAR.dbo.ChangeJobTaskAnalysisName
+-----------------------------------------------------------------
+USE [EXP_WAR]
+GO
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+CREATE PROCEDURE [dbo].[ChangeJobTaskAnalysisName](@JobId int, @NewName varchar(50))
+AS
+BEGIN
+
+	UPDATE [RMS_HYDRAJOB].[Job].[TaskProperty]
+	  SET	PropertyValue = left(	PropertyValue,
+									patindex('%<AnalysisName>%',[PropertyValue])
+									)
+							+'AnalysisName>'+ @NewName +'</AnalysisName>'
+							+right([PropertyValue],
+									len([PropertyValue])-patindex('%</AnalysisName>%',[PropertyValue])
+									-14)
+	  FROM			RMS_HYDRAJOB.Job.TaskProperty
+		inner join	RMS_HYDRAJOB.Job.Task on Task.TaskId = TaskProperty.TaskId
+	  where	jobid = @JobId
+		and propertyName = 'dlminput'
+
+END
+
+
+
